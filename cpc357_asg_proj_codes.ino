@@ -1,5 +1,5 @@
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include "VOneMqttClient.h"
 #include "DHT.h"
 #include <ESP32Servo.h>
 #include "environ.h"
@@ -16,7 +16,7 @@ const int HUMIDITY_THRESHOLD = 80;
 const int IR_SENSOR_1_PIN = 14;
 const int IR_SENSOR_2_PIN = 21;
 const int PASS_FIRST_IR_MAX_TIME = 5000;
-const int PASS_SECOND_IR_MAX_TIME = 0;
+const int PASS_SECOND_IR_MAX_TIME = 1000;
 const int COLOR_SENSOR_S0_PIN = 47;
 const int COLOR_SENSOR_S1_PIN = 48;
 const int COLOR_SENSOR_S2_PIN = 38;
@@ -37,14 +37,23 @@ const int RAIN_INTENSITY_THRESHOLD = 10;
 const int LIGHT_INTENSITY_THRESHOLD = 30;
 
 const int DC_MOTOR_PIN = A0;
-int DC_MOTOR_FAN_SPEED[4] = {0, 64, 128, 255};
+// int DC_MOTOR_FAN_SPEED[4] = {0, 64, 128, 255};
 const int SERVO_MOTOR_PIN = A1;
-const int SERVO_MOTOR_MOVING_TIME = 3000;
+
+// Cooling static datas
+bool is_able_to_override_cooling = true;
+// Shading static datas
+bool is_servo_rotation_needed = false;
+bool is_shade_open = false;
+bool is_start_time_set = false;
+unsigned long read_start_time = millis();
+int stop_angle = 180;
+bool is_reading_read = false;
+bool is_able_to_override_shading = true;
 
 DHT dht(DHT_PIN, DHT_TYPE);
 Servo myServo;
-WiFiClient espClient;
-PubSubClient client(espClient);
+VOneMqttClient client;
 void setup_wifi() {
   delay(10);
   Serial.println("Connecting to WiFi...");
@@ -58,17 +67,83 @@ void setup_wifi() {
   Serial.println(WiFi.localIP());
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.println("Attempting MQTT connection...");
-    if (client.connect("ESP32Client")) {
-      Serial.println("Connected to MQTT server");
-    } else {
-      Serial.print("Failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" Retrying in 5 seconds...");
-      delay(5000);
+void triggerActuator_callback(const char* actuatorDeviceId, const char* actuatorCommand)
+{
+  Serial.print("Main received callback : ");
+  Serial.print(actuatorDeviceId);
+  Serial.print(" : ");
+  Serial.println(actuatorCommand);
+
+  String errorMsg = "";
+
+  JSONVar commandObjct = JSON.parse(actuatorCommand);
+  JSONVar keys = commandObjct.keys();
+
+  if (String(actuatorDeviceId) == SERVO_MOTOR_DEVICE_ID)
+  {
+    String key = "";
+    String commandValue = "";
+    for (int i = 0; i < keys.length(); i++) {
+      key = (const char* )keys[i];
+      commandValue = (const char*)commandObjct[keys[i]];
+
     }
+    Serial.print("Key : ");
+    Serial.println(key.c_str());
+    Serial.print("value : ");
+    Serial.println(commandValue);
+
+    int angle = 0;
+    if (commandValue == "OPEN" && !is_shade_open) {
+      angle = 180;
+      is_shade_open = true;
+      is_able_to_override_shading = false;
+      myServo.write(angle);
+    }
+    else if (commandValue == "CLOSE" && is_shade_open) {
+      angle = 0;
+      is_shade_open = false;
+      is_able_to_override_shading = false;
+      myServo.write(angle);
+    }
+    else {
+      is_able_to_override_shading = true;
+    }
+    Serial.println(is_shade_open);
+    Serial.println(myServo.read());
+    client.publishActuatorStatusEvent(actuatorDeviceId, actuatorCommand, errorMsg.c_str(), true);//publish actuator status
+  }
+  else if (String(actuatorDeviceId) == DC_MOTOR_DEVICE_ID) {
+    String key = "";
+    String commandValue = "";
+    for (int i = 0; i < keys.length(); i++) {
+      key = (const char*)keys[i];
+      commandValue = (const char*)commandObjct[keys[i]];
+      Serial.print("Key : ");
+      Serial.println(key.c_str());
+      Serial.print("value : ");
+      Serial.println(commandValue);
+    }
+
+    if (commandValue == "ON") {
+      Serial.println("Fan ON");
+      digitalWrite(DC_MOTOR_PIN, HIGH);
+      is_able_to_override_cooling = false;
+    } else if (commandValue == "OFF") {
+      Serial.println("Fan OFF");
+      digitalWrite(DC_MOTOR_PIN, LOW);
+      is_able_to_override_cooling = false;
+    } else {
+      is_able_to_override_cooling = true;
+    }
+
+    client.publishActuatorStatusEvent(actuatorDeviceId, actuatorCommand, true);
+  }
+  else {
+    Serial.print(" No actuator found : ");
+    Serial.println(actuatorDeviceId);
+    errorMsg = "No actuator found";
+    client.publishActuatorStatusEvent(actuatorDeviceId, actuatorCommand, errorMsg.c_str(), false);//publish actuator status
   }
 }
 
@@ -77,7 +152,8 @@ void setup() {
   myServo.attach(SERVO_MOTOR_PIN);
   myServo.write(0);
   setup_wifi();
-  client.setServer(MQTT_SERVER, MQTT_PORT);
+  client.setup();
+  client.registerActuatorCallback(triggerActuator_callback);
   pinMode(CONTROL_PIN, OUTPUT);
   pinMode(DC_MOTOR_PIN, OUTPUT);
   pinMode(IR_SENSOR_1_PIN, INPUT_PULLUP);
@@ -114,6 +190,13 @@ void ingressEgressCounterFunction(){
       }
       is_color_data_taken = false;
       is_second_pin_triggered = false;
+      client.publishTelemetryData(IR_SENSOR_1_DEVICE_ID, "Obstacle", "False");
+      client.publishTelemetryData(IR_SENSOR_2_DEVICE_ID, "Obstacle", "False");
+      JSONVar payload_object_color;
+      payload_object_color["Red"] = 0;
+      payload_object_color["Green"] = 0;
+      payload_object_color["Blue"] = 0;
+      client.publishTelemetryData(COLOR_SENSOR_DEVICE_ID, payload_object_color);
     }
   }
   else {
@@ -149,12 +232,23 @@ void ingressEgressCounterFunction(){
           pass_second_ir_time = millis();
           Serial.println("Ingress Detected!!");
           char payload[1000];
+          client.publishTelemetryData(IR_SENSOR_2_DEVICE_ID, "Obstacle", "True");
+          JSONVar payload_object_color;
+          payload_object_color["Red"] = rgb[0];
+          payload_object_color["Green"] = rgb[1];
+          payload_object_color["Blue"] = rgb[2];
+          client.publishTelemetryData(COLOR_SENSOR_DEVICE_ID, payload_object_color);
+          JSONVar payload_object;
           // unsigned long time_difference;
           // if (pass_second_ir_time >= pass_first_ir_time) time_difference = pass_second_ir_time - pass_first_ir_time;
           // else time_difference = (ULONG_MAX - pass_first_ir_time) + pass_second_ir_time + 1;
           // float time_seconds = time_difference / 1000.0;
-          sprintf(payload, "Type: %s, Interval (s): %.2f, Color (R, G, B): (%d, %d, %d)", current_gress_type, (pass_second_ir_time - pass_first_ir_time) / 1000.0, rgb[0], rgb[1], rgb[2]);
-          client.publish(MQTT_TOPIC_MOVEMENT, payload);
+          payload_object["Type"] = current_gress_type;
+          payload_object["Interval"] = (pass_second_ir_time - pass_first_ir_time) / 1000.0;
+          payload_object["Red"] = rgb[0];
+          payload_object["Green"] = rgb[1];
+          payload_object["Blue"] = rgb[2];
+          client.publishTelemetryData(GRESS_SENSOR_DEVICE_ID, payload_object);
         }
       }
       // Reset if second IR sensor is not triggered within allowed time interval
@@ -167,6 +261,7 @@ void ingressEgressCounterFunction(){
         }
         is_color_data_taken = false;
         is_second_pin_triggered = false;
+        client.publishTelemetryData(IR_SENSOR_1_DEVICE_ID, "Obstacle", "False");
       }
     }
     // Egress
@@ -200,15 +295,26 @@ void ingressEgressCounterFunction(){
         if (is_second_pin_triggered && is_color_data_taken){
           pass_second_ir_time = millis();
           Serial.println("Egress Detected!!");
-          char payload[1000];
+          client.publishTelemetryData(IR_SENSOR_1_DEVICE_ID, "Obstacle", "True");
+          JSONVar payload_object_color;
+          payload_object_color["Red"] = rgb[0];
+          payload_object_color["Green"] = rgb[1];
+          payload_object_color["Blue"] = rgb[2];
+          client.publishTelemetryData(COLOR_SENSOR_DEVICE_ID, payload_object_color);
+          JSONVar payload_object;
           // unsigned long time_difference;
           // if (pass_second_ir_time >= pass_first_ir_time) time_difference = pass_second_ir_time - pass_first_ir_time;
           // else time_difference = (ULONG_MAX - pass_first_ir_time) + pass_second_ir_time + 1;
           // float time_seconds = time_difference / 1000.0;
-          sprintf(payload, "Type: %s, Interval (s): %.2f, Color (R, G, B): (%d, %d, %d)", current_gress_type, (pass_second_ir_time - pass_first_ir_time) / 1000.0, rgb[0], rgb[1], rgb[2]);
-          client.publish(MQTT_TOPIC_MOVEMENT, payload);
+          payload_object["Type"] = current_gress_type;
+          payload_object["Interval"] = (pass_second_ir_time - pass_first_ir_time) / 1000.0;
+          payload_object["Red"] = rgb[0];
+          payload_object["Green"] = rgb[1];
+          payload_object["Blue"] = rgb[2];
+          client.publishTelemetryData(GRESS_SENSOR_DEVICE_ID, payload_object);
         }
       }
+      // Reset if second IR sensor is not triggered within allowed time interval
       else {
         current_gress_type = gress_types[0];
         pass_first_ir_time = 0;
@@ -218,6 +324,7 @@ void ingressEgressCounterFunction(){
         }
         is_color_data_taken = false;
         is_second_pin_triggered = false;
+        client.publishTelemetryData(IR_SENSOR_2_DEVICE_ID, "Obstacle", "False");
       }
     }
     // No gress type
@@ -225,10 +332,12 @@ void ingressEgressCounterFunction(){
       if (!digitalRead(IR_SENSOR_1_PIN)){
         current_gress_type = gress_types[1];
         pass_first_ir_time = millis();
+        client.publishTelemetryData(IR_SENSOR_1_DEVICE_ID, "Obstacle", "True");
       }
       else if (!digitalRead(IR_SENSOR_2_PIN)){
         current_gress_type = gress_types[2];
         pass_first_ir_time = millis();
+        client.publishTelemetryData(IR_SENSOR_2_DEVICE_ID, "Obstacle", "True");
       }
     }
   }
@@ -256,11 +365,13 @@ bool hiveCoolingFunction(){
     float hif = dht.computeHeatIndex(temperature_fahrenheit, humidity);
     // int speed_based_on_humidity = 0;
     // int speed_based_on_temperature = 0;
-    if (humidity > HUMIDITY_THRESHOLD || temperature_celsius > TEMPERATURE_THRESHOLD){
-      digitalWrite(DC_MOTOR_PIN, HIGH);
-    }
-    else {
-      digitalWrite(DC_MOTOR_PIN, LOW);
+    if (is_able_to_override_cooling){
+      if (humidity > HUMIDITY_THRESHOLD || temperature_celsius > TEMPERATURE_THRESHOLD){
+        digitalWrite(DC_MOTOR_PIN, HIGH);
+      }
+      else {
+        digitalWrite(DC_MOTOR_PIN, LOW);
+      }
     }
     
     // // Evaluate fan speed needed based on humidity
@@ -291,12 +402,11 @@ bool hiveCoolingFunction(){
     //   analogWrite(DC_MOTOR_PIN, DC_MOTOR_FAN_SPEED[final_speed]);
     // }
 
-    char payload[1000];
-    sprintf(
-      payload,
-      "Humidity (%%): %.2f, Temperature (C): %.2f, Temperature (F): %.2f, Heat Index (C): %.2f, Heat Index (F): %.2f",
-      humidity, temperature_celsius, temperature_fahrenheit, hic, hif);
-    client.publish(MQTT_TOPIC_COOLING, payload);
+    JSONVar payload_object;
+    payload_object["Humidity"] = humidity;
+    payload_object["Temperature"] = temperature_celsius;
+    payload_object["Heat Index"] = hic;
+    client.publishTelemetryData(DHT_DEVICE_ID, payload_object);
     is_start_time_set = false;
     is_dht_begin = false;
     return true;
@@ -306,14 +416,6 @@ bool hiveCoolingFunction(){
 }
 
 bool hiveShadingFunction(){
-  static bool is_servo_rotation_needed = false;
-  static bool is_shade_open = false;
-  static bool is_start_time_set = false;
-  static unsigned long read_start_time = millis();
-  static unsigned long move_start_time = millis();
-  static int start_angle = 0;
-  static int stop_angle = 180;
-  static bool is_reading_read = false;
   int rain_intensity;
   int light_intensity;
 
@@ -326,10 +428,18 @@ bool hiveShadingFunction(){
     if (millis() - read_start_time >= SENSOR_DELAY_TIME){
       rain_intensity = map(analogRead(RAIN_SENSOR_ANALOG_PIN), 4095, 0, 0, 100);
       light_intensity = map(analogRead(LDR_SENSOR_ANALOG_PIN), 4095, 0, 0, 100);
-      char payload[1000];
-      sprintf(payload, "Rain: %s, Rain Intensity (%%): %d, Light Intensity (%%): %d", rain_intensity >= RAIN_INTENSITY_THRESHOLD ? "True" : "False", rain_intensity, light_intensity);
-      client.publish(MQTT_TOPIC_SHADE, payload);
+      JSONVar payload_object;
+      payload_object["Raining"] = rain_intensity >= RAIN_INTENSITY_THRESHOLD ? "True" : "False";
+      payload_object["Intensity"] = rain_intensity;
+      client.publishTelemetryData(RAIN_SENSOR_DEVICE_ID, payload_object);
+      client.publishTelemetryData(LDR_SENSOR_DEVICE_ID, "Intensity", light_intensity);
       is_reading_read = true;
+      if (!is_able_to_override_shading) {
+        is_servo_rotation_needed = false;
+        is_reading_read = false;
+        is_start_time_set = false;
+        return true;
+      }
     }
   }
 
@@ -337,17 +447,13 @@ bool hiveShadingFunction(){
     // It is raining but the shade is closed (Open shade)
     if ((rain_intensity >= RAIN_INTENSITY_THRESHOLD || light_intensity >= LIGHT_INTENSITY_THRESHOLD) && !is_shade_open) {
       is_servo_rotation_needed = true;
-      start_angle = 0;
       stop_angle = 180;
-      move_start_time = millis();
       is_shade_open = true;
     }
     // It is not raining but the shade is opened (Close shade)
     else if ((rain_intensity < RAIN_INTENSITY_THRESHOLD && light_intensity < LIGHT_INTENSITY_THRESHOLD) && is_shade_open) {
       is_servo_rotation_needed = true;
-      start_angle = 180;
       stop_angle = 0;
-      move_start_time = millis();
       is_shade_open = false;
     }
     // No action needed
@@ -360,18 +466,11 @@ bool hiveShadingFunction(){
   }
 
   if (is_reading_read && is_servo_rotation_needed) {
-    unsigned long progress = millis() - move_start_time;
-    // Move the motor
-    if (progress <= SERVO_MOTOR_MOVING_TIME) {
-      long angle = map(progress, 0, SERVO_MOTOR_MOVING_TIME, start_angle, stop_angle);
-      myServo.write(angle); 
-    }
-    else {
-      is_reading_read = false;
-      is_start_time_set = false;
-      is_servo_rotation_needed = false;
-      return true;
-    }
+    myServo.write(stop_angle);
+    is_reading_read = false;
+    is_start_time_set = false;
+    is_servo_rotation_needed = false;
+    return true;
   }
   return false;
 }
@@ -382,7 +481,14 @@ void loop() {
   static bool is_cooling_executed = false;
   static bool is_shading_executed = false;
   if (!client.connected()) {
-    reconnect();
+    client.reconnect();
+    client.publishDeviceStatusEvent(DHT_DEVICE_ID, true);
+    client.publishDeviceStatusEvent(RAIN_SENSOR_DEVICE_ID, true);
+    client.publishDeviceStatusEvent(LDR_SENSOR_DEVICE_ID, true);
+    client.publishDeviceStatusEvent(IR_SENSOR_1_DEVICE_ID, true);
+    client.publishDeviceStatusEvent(IR_SENSOR_2_DEVICE_ID, true);
+    client.publishDeviceStatusEvent(COLOR_SENSOR_DEVICE_ID, true);
+    client.publishDeviceStatusEvent(GRESS_SENSOR_DEVICE_ID, true);
   }
   client.loop();
 
