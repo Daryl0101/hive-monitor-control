@@ -4,6 +4,7 @@
 #include <ESP32Servo.h>
 #include "environ.h"
 
+const int VPERIPHERAL_DELAY_TIME = 15 * 60 * 1000;
 const int SENSOR_DELAY_TIME = 2000;
 const int CONTROL_PIN = 11;
 const int DHT_PIN = 42;
@@ -390,7 +391,7 @@ void loop() {
   ingressEgressCounterFunction();
 
   // Scheduled functions
-  if (millis() - last_execution_time > 10 * 1000){
+  if (millis() - last_execution_time > VPERIPHERAL_DELAY_TIME){
     // Switch on vperipheral if haven't
     if (!is_vperipheral_enabled){
       digitalWrite(CONTROL_PIN, HIGH);
