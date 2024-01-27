@@ -9,8 +9,8 @@ const int SENSOR_DELAY_TIME = 2000;
 const int CONTROL_PIN = 11;
 const int DHT_PIN = 42;
 const int DHT_TYPE = DHT11;
-const int TEMPERATURE_THRESHOLD = 40;
-const int HUMIDITY_THRESHOLD = 80;
+const int TEMPERATURE_THRESHOLD = 30;
+const int HUMIDITY_THRESHOLD = 76;
 // int TEMPERATURE_THRESHOLD[3] = {30, 35, 40};
 // int HUMIDITY_THRESHOLD[3] = {70, 80, 90};
 
@@ -34,7 +34,7 @@ const int BLUE_UPPER = 500;
 const int RAIN_SENSOR_DIGITAL_PIN = A4;
 const int RAIN_SENSOR_ANALOG_PIN = A5;
 const int LDR_SENSOR_ANALOG_PIN = A2;
-const int RAIN_INTENSITY_THRESHOLD = 10;
+const int RAIN_INTENSITY_THRESHOLD = 50;
 const int LIGHT_INTENSITY_THRESHOLD = 30;
 
 const int DC_MOTOR_PIN = A0;
@@ -311,8 +311,6 @@ bool hiveShadingFunction(){
   static bool is_shade_open = false;
   static bool is_start_time_set = false;
   static unsigned long read_start_time = millis();
-  static unsigned long move_start_time = millis();
-  static int start_angle = 0;
   static int stop_angle = 180;
   static bool is_reading_read = false;
   int rain_intensity;
@@ -338,17 +336,13 @@ bool hiveShadingFunction(){
     // It is raining but the shade is closed (Open shade)
     if ((rain_intensity >= RAIN_INTENSITY_THRESHOLD || light_intensity >= LIGHT_INTENSITY_THRESHOLD) && !is_shade_open) {
       is_servo_rotation_needed = true;
-      start_angle = 0;
       stop_angle = 180;
-      move_start_time = millis();
       is_shade_open = true;
     }
     // It is not raining but the shade is opened (Close shade)
     else if ((rain_intensity < RAIN_INTENSITY_THRESHOLD && light_intensity < LIGHT_INTENSITY_THRESHOLD) && is_shade_open) {
       is_servo_rotation_needed = true;
-      start_angle = 180;
       stop_angle = 0;
-      move_start_time = millis();
       is_shade_open = false;
     }
     // No action needed
@@ -361,18 +355,11 @@ bool hiveShadingFunction(){
   }
 
   if (is_reading_read && is_servo_rotation_needed) {
-    unsigned long progress = millis() - move_start_time;
-    // Move the motor
-    if (progress <= SERVO_MOTOR_MOVING_TIME) {
-      long angle = map(progress, 0, SERVO_MOTOR_MOVING_TIME, start_angle, stop_angle);
-      myServo.write(angle); 
-    }
-    else {
-      is_reading_read = false;
-      is_start_time_set = false;
-      is_servo_rotation_needed = false;
-      return true;
-    }
+    myServo.write(stop_angle);
+    is_reading_read = false;
+    is_start_time_set = false;
+    is_servo_rotation_needed = false;
+    return true;
   }
   return false;
 }
